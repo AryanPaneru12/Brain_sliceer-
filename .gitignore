@@ -7,3 +7,7 @@ weights.hdf5
 Healthcare_AI.ipynb
 Untitled.ipynb
 *.hdf5
+
+.venv/
+artifacts/
+src/brain_tumor_pipeline.egg-info/
