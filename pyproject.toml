@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain-tumor-pipeline"
+version = "0.1.0"
+description = "Patient-safe two-stage ResNet50 and ResUNet training pipeline for LGG MRI segmentation."
+requires-python = ">=3.12"
+dependencies = [
+    "tensorflow==2.19.0",
+    "keras==3.11.1",
+    "numpy==1.26.4",
+    "pandas==2.3.1",
+    "scikit-learn==1.9.0",
+    "opencv-python==4.10.0.84",
+    "scipy==1.13.1",
+]
+
+[project.optional-dependencies]
+tracking = ["mlflow==3.14.0"]
+
+[project.scripts]
+brain-tumor-train = "brain_tumor_pipeline.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
