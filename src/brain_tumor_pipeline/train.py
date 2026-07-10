@@ -30,26 +30,37 @@ from brain_tumor_pipeline.models import (
 )
 
 
-def callbacks(output_dir: Path, name: str) -> list[tf.keras.callbacks.Callback]:
+def callbacks(
+    output_dir: Path,
+    name: str,
+    monitor: str = "val_loss",
+    mode: str = "min",
+    patience: int = 12,
+    reduce_lr_patience: int = 4,
+    min_lr: float = 1e-7,
+) -> list[tf.keras.callbacks.Callback]:
     output_dir.mkdir(parents=True, exist_ok=True)
     return [
         tf.keras.callbacks.ModelCheckpoint(
             filepath=str(output_dir / f"{name}.keras"),
-            monitor="val_loss",
+            monitor=monitor,
+            mode=mode,
             save_best_only=True,
             verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=20,
+            monitor=monitor,
+            mode=mode,
+            patience=patience,
             restore_best_weights=True,
             verbose=1,
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
+            monitor=monitor,
+            mode=mode,
             factor=0.5,
-            patience=6,
-            min_lr=1e-7,
+            patience=reduce_lr_patience,
+            min_lr=min_lr,
             verbose=1,
         ),
         tf.keras.callbacks.CSVLogger(str(output_dir / f"{name}_history.csv")),
@@ -73,8 +84,69 @@ def log_run_config(config: TrainingConfig, output_dir: Path) -> None:
     (output_dir / "config.json").write_text(json.dumps(config.to_dict(), indent=2), encoding="utf-8")
 
 
-def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> tf.keras.Model:
+def configure_runtime(config: TrainingConfig) -> None:
     tf.keras.utils.set_random_seed(config.random_seed)
+    if config.mixed_precision:
+        tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
+
+def write_dataset_report(df: pd.DataFrame, output_dir: Path, split_name: str = "all") -> dict[str, object]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    patient_summary = df.groupby("patient_id")["mask"].agg(["count", "sum", "mean"])
+    class_counts = df["mask"].value_counts().sort_index()
+    report: dict[str, object] = {
+        "split": split_name,
+        "rows": int(len(df)),
+        "patients": int(df["patient_id"].nunique()),
+        "negative_images": int(class_counts.get(0, 0)),
+        "positive_images": int(class_counts.get(1, 0)),
+        "positive_image_fraction": float(df["mask"].mean()) if len(df) else 0.0,
+        "positive_patients": int((patient_summary["sum"] > 0).sum()),
+        "negative_only_patients": int((patient_summary["sum"] == 0).sum()),
+        "slices_per_patient_min": int(patient_summary["count"].min()) if len(patient_summary) else 0,
+        "slices_per_patient_median": float(patient_summary["count"].median()) if len(patient_summary) else 0.0,
+        "slices_per_patient_max": int(patient_summary["count"].max()) if len(patient_summary) else 0,
+    }
+    (output_dir / f"dataset_report_{split_name}.json").write_text(
+        json.dumps(report, indent=2),
+        encoding="utf-8",
+    )
+    return report
+
+
+def write_history_report(
+    history: tf.keras.callbacks.History,
+    output_dir: Path,
+    name: str,
+    primary_metric: str,
+) -> dict[str, object]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    values = history.history
+    report: dict[str, object] = {"run": name, "epochs_completed": len(values.get("loss", []))}
+    for key, series in values.items():
+        if not series:
+            continue
+        report[f"last_{key}"] = float(series[-1])
+        if key.startswith("val_") or key in {"loss", "val_loss"}:
+            report[f"best_{key}"] = float(min(series) if "loss" in key else max(series))
+
+    train_key = primary_metric
+    val_key = f"val_{primary_metric}"
+    if train_key in values and val_key in values and values[train_key] and values[val_key]:
+        train_last = float(values[train_key][-1])
+        val_last = float(values[val_key][-1])
+        report[f"{primary_metric}_train_val_gap"] = train_last - val_last
+        if train_last - val_last > 0.12:
+            report["overfitting_warning"] = (
+                f"Last training {primary_metric} is more than 0.12 above validation. "
+                "Use stronger augmentation, lower fine-tune layers, more dropout, or fewer epochs."
+            )
+    (output_dir / f"{name}_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> tf.keras.Model:
+    configure_runtime(config)
     df = load_metadata(config.metadata_csv, config.dataset_dir) if df is None else df.copy()
     train, val, test = group_train_val_test_split(
         df,
@@ -94,10 +166,21 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
 
     output_dir = config.output_dir / "classifier"
     log_run_config(config, output_dir)
+    write_dataset_report(df, output_dir, "all")
+    write_dataset_report(train, output_dir, "train")
+    write_dataset_report(val, output_dir, "val")
+    write_dataset_report(test, output_dir, "test")
     weights = class_weights(train)
     model = compile_classifier(
-        build_resnet50_classifier(input_shape=(*config.image_size, 3)),
+        build_resnet50_classifier(
+            input_shape=(*config.image_size, 3),
+            dropout_rate=config.classifier_dropout,
+            l2_regularization=config.classifier_l2,
+        ),
         learning_rate=config.initial_learning_rate,
+        weight_decay=config.weight_decay,
+        label_smoothing=config.label_smoothing,
+        clipnorm=config.gradient_clipnorm,
     )
 
     with mlflow_run(config, "classifier") as run:
@@ -106,23 +189,52 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
 
             mlflow.log_params(config.to_dict())
             mlflow.log_param("class_weight", weights)
-        model.fit(
+        head_history = model.fit(
             train_gen,
             validation_data=val_gen,
             epochs=config.classifier_epochs,
-            callbacks=callbacks(output_dir, "resnet50_head"),
+            callbacks=callbacks(
+                output_dir,
+                "resnet50_head",
+                monitor="val_auc",
+                mode="max",
+                patience=config.early_stopping_patience,
+                reduce_lr_patience=config.reduce_lr_patience,
+                min_lr=config.min_learning_rate,
+            ),
             class_weight=weights,
         )
+        write_history_report(head_history, output_dir, "resnet50_head", primary_metric="auc")
 
         if config.classifier_fine_tune_epochs > 0:
             unfreeze_resnet_top_layers(model, n_layers=config.classifier_fine_tune_layers)
-            compile_classifier(model, learning_rate=config.initial_learning_rate * 0.1)
-            model.fit(
+            compile_classifier(
+                model,
+                learning_rate=config.initial_learning_rate * 0.1,
+                weight_decay=config.weight_decay,
+                label_smoothing=config.label_smoothing,
+                clipnorm=config.gradient_clipnorm,
+            )
+            fine_tune_history = model.fit(
                 train_gen,
                 validation_data=val_gen,
                 epochs=config.classifier_fine_tune_epochs,
-                callbacks=callbacks(output_dir, "resnet50_finetuned"),
+                callbacks=callbacks(
+                    output_dir,
+                    "resnet50_finetuned",
+                    monitor="val_auc",
+                    mode="max",
+                    patience=config.early_stopping_patience,
+                    reduce_lr_patience=config.reduce_lr_patience,
+                    min_lr=config.min_learning_rate,
+                ),
                 class_weight=weights,
+            )
+            write_history_report(
+                fine_tune_history,
+                output_dir,
+                "resnet50_finetuned",
+                primary_metric="auc",
             )
 
         metrics = model.evaluate(test_gen, verbose=1, return_dict=True)
@@ -156,8 +268,15 @@ def cross_validate_classifier(config: TrainingConfig) -> list[dict[str, float]]:
         log_run_config(config, output_dir)
         weights = class_weights(train)
         model = compile_classifier(
-            build_resnet50_classifier(input_shape=(*config.image_size, 3)),
+            build_resnet50_classifier(
+                input_shape=(*config.image_size, 3),
+                dropout_rate=config.classifier_dropout,
+                l2_regularization=config.classifier_l2,
+            ),
             learning_rate=config.initial_learning_rate,
+            weight_decay=config.weight_decay,
+            label_smoothing=config.label_smoothing,
+            clipnorm=config.gradient_clipnorm,
         )
         with mlflow_run(config, f"classifier_fold_{fold}") as run:
             if run is not None:
@@ -165,22 +284,51 @@ def cross_validate_classifier(config: TrainingConfig) -> list[dict[str, float]]:
 
                 mlflow.log_params(config.to_dict())
                 mlflow.log_param("fold", fold)
-            model.fit(
+            head_history = model.fit(
                 train_gen,
                 validation_data=val_gen,
                 epochs=config.classifier_epochs,
-                callbacks=callbacks(output_dir, "resnet50_head"),
+                callbacks=callbacks(
+                    output_dir,
+                    "resnet50_head",
+                    monitor="val_auc",
+                    mode="max",
+                    patience=config.early_stopping_patience,
+                    reduce_lr_patience=config.reduce_lr_patience,
+                    min_lr=config.min_learning_rate,
+                ),
                 class_weight=weights,
             )
+            write_history_report(head_history, output_dir, "resnet50_head", primary_metric="auc")
             if config.classifier_fine_tune_epochs > 0:
                 unfreeze_resnet_top_layers(model, n_layers=config.classifier_fine_tune_layers)
-                compile_classifier(model, learning_rate=config.initial_learning_rate * 0.1)
-                model.fit(
+                compile_classifier(
+                    model,
+                    learning_rate=config.initial_learning_rate * 0.1,
+                    weight_decay=config.weight_decay,
+                    label_smoothing=config.label_smoothing,
+                    clipnorm=config.gradient_clipnorm,
+                )
+                fine_tune_history = model.fit(
                     train_gen,
                     validation_data=val_gen,
                     epochs=config.classifier_fine_tune_epochs,
-                    callbacks=callbacks(output_dir, "resnet50_finetuned"),
+                    callbacks=callbacks(
+                        output_dir,
+                        "resnet50_finetuned",
+                        monitor="val_auc",
+                        mode="max",
+                        patience=config.early_stopping_patience,
+                        reduce_lr_patience=config.reduce_lr_patience,
+                        min_lr=config.min_learning_rate,
+                    ),
                     class_weight=weights,
+                )
+                write_history_report(
+                    fine_tune_history,
+                    output_dir,
+                    "resnet50_finetuned",
+                    primary_metric="auc",
                 )
             metrics = model.evaluate(val_gen, verbose=1, return_dict=True)
             fold_metrics = {"fold": fold, **{key: float(value) for key, value in metrics.items()}}
@@ -230,7 +378,7 @@ def train_segmenter(
     val: pd.DataFrame | None = None,
     output_name: str = "segmenter",
 ) -> tuple[tf.keras.Model, dict[str, float]]:
-    tf.keras.utils.set_random_seed(config.random_seed)
+    configure_runtime(config)
     if train is None or val is None:
         df = load_metadata(config.metadata_csv, config.dataset_dir)
         if config.segmenter_positive_only:
@@ -253,9 +401,13 @@ def train_segmenter(
 
     output_dir = config.output_dir / output_name
     log_run_config(config, output_dir)
+    write_dataset_report(train, output_dir, "train")
+    write_dataset_report(val, output_dir, "val")
     model = compile_segmenter(
         build_resunet(input_shape=(*config.image_size, 3)),
         learning_rate=config.initial_learning_rate,
+        weight_decay=config.weight_decay,
+        clipnorm=config.gradient_clipnorm,
     )
 
     with mlflow_run(config, output_name) as run:
@@ -263,12 +415,21 @@ def train_segmenter(
             import mlflow
 
             mlflow.log_params(config.to_dict())
-        model.fit(
+        history = model.fit(
             train_gen,
             validation_data=val_gen,
             epochs=config.segmenter_epochs,
-            callbacks=callbacks(output_dir, "resunet"),
+            callbacks=callbacks(
+                output_dir,
+                "resunet",
+                monitor="val_dice_coefficient",
+                mode="max",
+                patience=config.early_stopping_patience,
+                reduce_lr_patience=config.reduce_lr_patience,
+                min_lr=config.min_learning_rate,
+            ),
         )
+        write_history_report(history, output_dir, "resunet", primary_metric="dice_coefficient")
         metrics = evaluate_segmentation(model, val_gen)
         (output_dir / "validation_metrics.json").write_text(
             json.dumps(metrics, indent=2), encoding="utf-8"
@@ -320,6 +481,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--classifier-epochs", type=int, default=None)
+    parser.add_argument("--fine-tune-epochs", type=int, default=None)
+    parser.add_argument("--segmenter-epochs", type=int, default=None)
+    parser.add_argument("--fine-tune-layers", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--label-smoothing", type=float, default=None)
+    parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--use-mlflow", action="store_true")
     return parser.parse_args()
 
@@ -338,6 +508,26 @@ def main() -> None:
     if args.epochs is not None:
         config.classifier_epochs = args.epochs
         config.segmenter_epochs = args.epochs
+        if args.fine_tune_epochs is None:
+            config.classifier_fine_tune_epochs = 0
+    if args.classifier_epochs is not None:
+        config.classifier_epochs = args.classifier_epochs
+    if args.fine_tune_epochs is not None:
+        config.classifier_fine_tune_epochs = args.fine_tune_epochs
+    if args.segmenter_epochs is not None:
+        config.segmenter_epochs = args.segmenter_epochs
+    if args.fine_tune_layers is not None:
+        config.classifier_fine_tune_layers = args.fine_tune_layers
+    if args.learning_rate is not None:
+        config.initial_learning_rate = args.learning_rate
+    if args.weight_decay is not None:
+        config.weight_decay = args.weight_decay
+    if args.dropout is not None:
+        config.classifier_dropout = args.dropout
+    if args.label_smoothing is not None:
+        config.label_smoothing = args.label_smoothing
+    if args.mixed_precision:
+        config.mixed_precision = True
     config.use_mlflow = args.use_mlflow
 
     if args.cross_validate:

@@ -28,6 +28,8 @@ from brain_tumor_pipeline.metrics import (
 def build_resnet50_classifier(
     input_shape: tuple[int, int, int] = (256, 256, 3),
     weights: str | None = "imagenet",
+    dropout_rate: float = 0.45,
+    l2_regularization: float = 1e-4,
 ) -> Model:
     inputs = Input(shape=input_shape, name="image")
     backbone = ResNet50(
@@ -39,18 +41,55 @@ def build_resnet50_classifier(
     backbone.trainable = False
     x = backbone(inputs, training=False)
     x = GlobalAveragePooling2D(name="avg_pool")(x)
-    x = Dense(256, activation="relu", name="classifier_dense_1")(x)
-    x = Dropout(0.3, name="classifier_dropout_1")(x)
-    x = Dense(256, activation="relu", name="classifier_dense_2")(x)
-    x = Dropout(0.3, name="classifier_dropout_2")(x)
-    outputs = Dense(2, activation="softmax", name="tumor_probability")(x)
+    regularizer = tf.keras.regularizers.l2(l2_regularization) if l2_regularization > 0 else None
+    x = Dropout(dropout_rate * 0.5, name="classifier_input_dropout")(x)
+    x = Dense(
+        256,
+        activation="relu",
+        kernel_regularizer=regularizer,
+        name="classifier_dense_1",
+    )(x)
+    x = BatchNormalization(name="classifier_bn_1")(x)
+    x = Dropout(dropout_rate, name="classifier_dropout_1")(x)
+    x = Dense(
+        128,
+        activation="relu",
+        kernel_regularizer=regularizer,
+        name="classifier_dense_2",
+    )(x)
+    x = BatchNormalization(name="classifier_bn_2")(x)
+    x = Dropout(dropout_rate, name="classifier_dropout_2")(x)
+    outputs = Dense(2, activation="softmax", dtype="float32", name="tumor_probability")(x)
     return Model(inputs=inputs, outputs=outputs, name="resnet50_tumor_classifier")
 
 
-def compile_classifier(model: Model, learning_rate: float = 1e-4) -> Model:
+def _adam_optimizer(
+    learning_rate: float = 1e-4,
+    weight_decay: float = 0.0,
+    clipnorm: float | None = 1.0,
+):
+    kwargs = {"learning_rate": learning_rate}
+    if clipnorm is not None and clipnorm > 0:
+        kwargs["clipnorm"] = clipnorm
+    if weight_decay and weight_decay > 0:
+        return tf.keras.optimizers.AdamW(weight_decay=weight_decay, **kwargs)
+    return tf.keras.optimizers.Adam(**kwargs)
+
+
+def compile_classifier(
+    model: Model,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-4,
+    label_smoothing: float = 0.03,
+    clipnorm: float | None = 1.0,
+) -> Model:
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="categorical_crossentropy",
+        optimizer=_adam_optimizer(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            clipnorm=clipnorm,
+        ),
+        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing),
         metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
     )
     return model
@@ -125,13 +164,22 @@ def build_resunet(input_shape: tuple[int, int, int] = (256, 256, 3)) -> Model:
     up4 = _upsample_concat(up3, conv1)
     up4 = _resblock(up4, 16)
 
-    outputs = Conv2D(1, (1, 1), padding="same", activation="sigmoid", name="mask")(up4)
+    outputs = Conv2D(1, (1, 1), padding="same", activation="sigmoid", dtype="float32", name="mask")(up4)
     return Model(inputs=inputs, outputs=outputs, name="resunet_segmenter")
 
 
-def compile_segmenter(model: Model, learning_rate: float = 1e-4) -> Model:
+def compile_segmenter(
+    model: Model,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-4,
+    clipnorm: float | None = 1.0,
+) -> Model:
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        optimizer=_adam_optimizer(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            clipnorm=clipnorm,
+        ),
         loss=focal_tversky,
         metrics=[tversky, dice_coefficient, iou_coefficient],
     )

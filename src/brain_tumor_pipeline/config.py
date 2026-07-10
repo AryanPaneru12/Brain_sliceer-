@@ -25,6 +25,11 @@ class TrainingConfig:
     batch_size: int = 16
     random_seed: int = 42
     initial_learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
+    gradient_clipnorm: float = 1.0
+    label_smoothing: float = 0.03
+    classifier_dropout: float = 0.45
+    classifier_l2: float = 1e-4
     classifier_epochs: int = 100
     classifier_fine_tune_epochs: int = 30
     classifier_fine_tune_layers: int = 75
@@ -35,6 +40,10 @@ class TrainingConfig:
     segmenter_positive_only: bool = True
     use_mlflow: bool = False
     mlflow_experiment: str = "brain-tumor-pipeline"
+    early_stopping_patience: int = 12
+    reduce_lr_patience: int = 4
+    min_learning_rate: float = 1e-7
+    mixed_precision: bool = False
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root)
