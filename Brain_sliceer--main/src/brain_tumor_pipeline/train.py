@@ -30,6 +30,10 @@ from brain_tumor_pipeline.models import (
 )
 
 
+def log_progress(message: str) -> None:
+    print(f"[brain-tumor-train] {message}", flush=True)
+
+
 def callbacks(
     output_dir: Path,
     name: str,
@@ -85,9 +89,11 @@ def log_run_config(config: TrainingConfig, output_dir: Path) -> None:
 
 
 def configure_runtime(config: TrainingConfig) -> None:
+    log_progress("Configuring TensorFlow runtime")
     tf.keras.utils.set_random_seed(config.random_seed)
     if config.mixed_precision:
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        log_progress("Mixed precision enabled")
 
 
 def write_dataset_report(df: pd.DataFrame, output_dir: Path, split_name: str = "all") -> dict[str, object]:
@@ -147,7 +153,10 @@ def write_history_report(
 
 def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> tf.keras.Model:
     configure_runtime(config)
+    log_progress(f"Loading classifier metadata from {config.dataset_dir}")
     df = load_metadata(config.metadata_csv, config.dataset_dir) if df is None else df.copy()
+    log_progress(f"Loaded {len(df)} image rows across {df['patient_id'].nunique()} patients")
+    log_progress("Creating patient-safe train/validation/test split")
     train, val, test = group_train_val_test_split(
         df,
         validation_size=config.validation_size,
@@ -155,6 +164,8 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
         random_state=config.random_seed,
     )
     assert_no_patient_overlap(train, val, test)
+    log_progress(f"Split rows: train={len(train)}, val={len(val)}, test={len(test)}")
+    log_progress("Creating classifier data generators")
     train_gen, val_gen, test_gen = classification_generators(
         train,
         val,
@@ -163,6 +174,7 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
         image_size=config.image_size,
         batch_size=config.batch_size,
     )
+    log_progress(f"Generator batches: train={len(train_gen)}, val={len(val_gen)}, test={len(test_gen)}")
 
     output_dir = config.output_dir / "classifier"
     log_run_config(config, output_dir)
@@ -171,6 +183,7 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
     write_dataset_report(val, output_dir, "val")
     write_dataset_report(test, output_dir, "test")
     weights = class_weights(train)
+    log_progress("Building ResNet50 classifier. This may download ImageNet weights on the first run.")
     model = compile_classifier(
         build_resnet50_classifier(
             input_shape=(*config.image_size, 3),
@@ -189,6 +202,7 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
 
             mlflow.log_params(config.to_dict())
             mlflow.log_param("class_weight", weights)
+        log_progress(f"Starting classifier head training for {config.classifier_epochs} epochs")
         head_history = model.fit(
             train_gen,
             validation_data=val_gen,
@@ -207,6 +221,9 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
         write_history_report(head_history, output_dir, "resnet50_head", primary_metric="auc")
 
         if config.classifier_fine_tune_epochs > 0:
+            log_progress(
+                f"Starting classifier fine-tuning for {config.classifier_fine_tune_epochs} epochs"
+            )
             unfreeze_resnet_top_layers(model, n_layers=config.classifier_fine_tune_layers)
             compile_classifier(
                 model,
@@ -237,6 +254,7 @@ def train_classifier(config: TrainingConfig, df: pd.DataFrame | None = None) -> 
                 primary_metric="auc",
             )
 
+        log_progress("Evaluating classifier on the test split")
         metrics = model.evaluate(test_gen, verbose=1, return_dict=True)
         (output_dir / "test_metrics.json").write_text(
             json.dumps(metrics, indent=2), encoding="utf-8"
@@ -380,9 +398,12 @@ def train_segmenter(
 ) -> tuple[tf.keras.Model, dict[str, float]]:
     configure_runtime(config)
     if train is None or val is None:
+        log_progress(f"Loading segmenter metadata from {config.dataset_dir}")
         df = load_metadata(config.metadata_csv, config.dataset_dir)
         if config.segmenter_positive_only:
             df = df[df["mask"] == 1].copy()
+            log_progress(f"Using {len(df)} positive-mask rows for segmentation")
+        log_progress("Creating segmenter train/validation split")
         train, val, _ = group_train_val_test_split(
             df,
             validation_size=config.validation_size,
@@ -390,6 +411,8 @@ def train_segmenter(
             random_state=config.random_seed,
         )
     assert_no_patient_overlap(train, val)
+    log_progress(f"Segmenter split rows: train={len(train)}, val={len(val)}")
+    log_progress("Creating segmenter data generators")
     train_gen, val_gen = segmentation_generators(
         train,
         val,
@@ -398,11 +421,13 @@ def train_segmenter(
         batch_size=config.batch_size,
         seed=config.random_seed,
     )
+    log_progress(f"Segmenter batches: train={len(train_gen)}, val={len(val_gen)}")
 
     output_dir = config.output_dir / output_name
     log_run_config(config, output_dir)
     write_dataset_report(train, output_dir, "train")
     write_dataset_report(val, output_dir, "val")
+    log_progress("Building ResUNet segmenter")
     model = compile_segmenter(
         build_resunet(input_shape=(*config.image_size, 3)),
         learning_rate=config.initial_learning_rate,
@@ -415,6 +440,7 @@ def train_segmenter(
             import mlflow
 
             mlflow.log_params(config.to_dict())
+        log_progress(f"Starting segmenter training for {config.segmenter_epochs} epochs")
         history = model.fit(
             train_gen,
             validation_data=val_gen,
@@ -430,6 +456,7 @@ def train_segmenter(
             ),
         )
         write_history_report(history, output_dir, "resunet", primary_metric="dice_coefficient")
+        log_progress("Evaluating segmenter")
         metrics = evaluate_segmentation(model, val_gen)
         (output_dir / "validation_metrics.json").write_text(
             json.dumps(metrics, indent=2), encoding="utf-8"
@@ -529,6 +556,14 @@ def main() -> None:
     if args.mixed_precision:
         config.mixed_precision = True
     config.use_mlflow = args.use_mlflow
+
+    log_progress(
+        "Starting run with "
+        f"stage={args.stage}, dataset_dir={config.dataset_dir}, output_dir={config.output_dir}, "
+        f"batch_size={config.batch_size}, classifier_epochs={config.classifier_epochs}, "
+        f"fine_tune_epochs={config.classifier_fine_tune_epochs}, "
+        f"segmenter_epochs={config.segmenter_epochs}"
+    )
 
     if args.cross_validate:
         if args.stage in {"classifier", "all"}:
